@@ -69,7 +69,7 @@ def test_a_band_too_big_for_the_sheet_is_cut_across_its_wall():
     assert plan["counts"]["errors"] == 0
     first = [s for s in plan["slices"] if s["label"].startswith("X")]
     assert first and all(len(s["pieces"]) >= 2 for s in first)        # placed first, so whole until the sheet says no
-    for sheet, g in _polys(plan):
+    for _, g in _polys(plan):
         x0, y0, x1, y1 = g.bounds
         assert x1 <= 170 and y1 <= 170
 
@@ -89,6 +89,6 @@ def test_a_ring_slice_too_big_for_the_sheet_is_cut_across_its_wall_not_in_strips
         area = sum(pc["area"] for pc in sl["pieces"])
         assert abs(area - (180 ** 2 - 156 ** 2)) < 300                 # still the ring: nothing added, nothing lost
         assert len(sl["pieces"]) >= 2
-    for sheet, g in _polys(plan):
+    for _, g in _polys(plan):
         x0, y0, x1, y1 = g.bounds
         assert x1 <= 170 and y1 <= 170
