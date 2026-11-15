@@ -1315,3 +1315,22 @@ def test_the_cube_snaps_on_a_click_and_a_drag_turns_the_view_not_the_model(page)
     assert not flat(look())
     assert page.evaluate("() => window.__t.state().rotate") == [0, 0, 0]
     assert page.evaluate("() => window.__t.idle()")
+
+
+def test_a_ring_slice_takes_its_own_wall_from_the_selection_panel(page):
+    """Ring slices on stacked: the wall box shows when rings are on, and a slice selected in the 3D view takes its own
+    wall from the selection panel, which reaches the slicer (`wall`) and leaves that slice's ring wider."""
+    page.click('nav button[data-t="model"]'); page.select_option("#example", "cube"); settle(page)
+    page.click('nav button[data-t="technique"]'); page.click('#modes button[data-m="stacked"]'); settle(page)
+    set_fields(page, [("p_distribution", "count"), ("p_count", 4), ("p_connect", "none"), ("p_rings", True), ("p_ring_wall", 10)])
+    settle(page)
+    area = lambda p, lab: sum(pc["area"] for s in p["slices"] if s["label"] == lab for pc in s["pieces"])   # noqa: E731
+    before = area(plan(page), "Z-2")
+    assert abs(before - (180 ** 2 - 160 ** 2)) < 200, before
+    page.evaluate("() => window.__t.select('Z-2')"); page.wait_for_timeout(200)
+    assert page.is_visible("#n_wall"), "no wall box in the selection panel"
+    page.fill("#n_wall", "30"); page.dispatch_event("#n_wall", "change"); settle(page)
+    assert abs(page.evaluate("() => window.__t.state().wall['Z-2']") - 30) < 1e-6
+    assert abs(area(plan(page), "Z-2") - (180 ** 2 - 120 ** 2)) < 300
+    assert abs(area(plan(page), "Z-3") - before) < 1                    # the others keep the stack's wall
+    assert not page.errors, page.errors
