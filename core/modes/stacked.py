@@ -67,7 +67,7 @@ class Stacked(Mode):
               "A slice can have its own: select it in the 3D view", 0.5, 500, 0.5, unit="mm", show_if=("rings", True), label="wall"),
         Param("ring_caps", "bool", False, "Keep the first and last slice solid, so the stack is closed at both ends. Off = they are rings too",
               show_if=("rings", True), label="solid ends"),
-        Param("wall", "map", {}, "Per-slice ring wall (mm), when ring slices are on", group="slices", unit="mm"),
+        Param("wall", "map", {}, "Per-slice ring wall (mm), when ring slices are on", group="slices", unit="mm", label="own walls"),
         Param("next_outline", "bool", False, "Engrave the outline of the next layer onto each slice (GUIDE, orange): a light line showing where the layer stacked on top sits, so the stack lines up as it is glued. Drawn only where it lands on the slice's own material — a wider layer above stops at this layer's edge. Engrave, not cut; off by default", label="next layer outline"),
         Param("next_outline_offset", "number", 0.0, "Move the engraved outline in (−) or out (+) from the next layer's true edge (mm). A little negative — −0.25 or so — tucks the line under the layer above, so a glue-up a hair off still hides it; positive marks an overhang where the next layer is wider", -5, 5, 0.05, unit="mm", show_if=("next_outline", True), label="outline offset"),
         Param("connect", "choice", "dowel", CONNECT_HELP, choices=["none", "dowel", "tab"]),
