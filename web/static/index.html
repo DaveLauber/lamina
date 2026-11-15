@@ -451,7 +451,7 @@ function field(p){
   else if(p.type==='curve')inp=`<span class="hint">drawn in the graph under the 3D view</span>`;
   else if(p.type==='points')inp=`<div class="rows" id="${id}">${(v||[]).map((q,i)=>`<div class="r"><small>${i+1}</small><input type="number" step="any" value="${show(p,q[0])}" data-pt="${p.name}" data-i="${i}" data-j="0"><input type="number" step="any" value="${show(p,q[1])}" data-pt="${p.name}" data-i="${i}" data-j="1"><button class="small x" data-del="${p.name}" data-i="${i}">×</button></div>`).join('')}<div class="r"><button class="small" data-add="${p.name}">+ point</button><span class="hint">or alt-click in the 3D view</span></div></div>`;
   else if(p.type==='lines3')inp=`<div class="rows" id="${id}">${(v||[]).length?`<div class="r hint"><small></small>${['x','y','z'].map(a=>`<span style="flex:1;text-align:center">${a} (${unit})</span>`).join('')}<span style="flex:0 0 24px"></span></div>`:''}${(v||[]).map((l,i)=>[0,1].map(e=>`<div class="r"><small>${e?'end':`${i+1} start`}</small>${[0,1,2].map(j=>`<input type="number" step="any" value="${show(p,l[e][j])}" data-ln="${p.name}" data-i="${i}" data-e="${e}" data-j="${j}" title="${e?'end':'start'} ${'xyz'[j]}">`).join('')}<span style="flex:0 0 24px">${e?'':`<button class="small x" data-del="${p.name}" data-i="${i}">×</button>`}</span></div>`).join('')).join('')}<div class="r"><button class="small" data-add="${p.name}">${{axes:'+ split an axis',branches:'+ branch'}[p.name]||'+ line'}</button><span class="hint">${{axes:'or alt-click the model for a parallel axis · drag them in the 3D view',branches:'or shift+alt-click a hoof, hand or tail tip · drag the ends in the 3D view · alt-click one to remove it'}[p.name]||'one straight dowel per line · or alt-click the model: a line up through that point'}</span></div></div>`;
-  else if(p.type==='map'){const rows=Object.entries(v||{});if(selected&&!(selected in (v||{})))rows.push([selected,p.name==='thick'?state.thickness:0]);
+  else if(p.type==='map'){const rows=Object.entries(v||{});if(selected&&!(selected in (v||{})))rows.push([selected,p.name==='thick'?state.thickness:p.name==='wall'?state.ring_wall:0]);
     inp=`<div class="rows" id="${id}">${rows.map(([k,x])=>`<div class="r"><small>${esc(k)}</small><input type="number" step="any" value="${show(p,x)}" data-map="${p.name}" data-k="${esc(k)}">${k in (v||{})?`<button class="small x" data-del="${p.name}" data-i="${esc(k)}">×</button>`:'<span class="hint">default</span>'}</div>`).join('')||'<span class="hint">no overrides — select a part in the 3D view and use the sliders</span>'}</div>`}
   else if(p.type==='labels'||p.type==='chips')inp=`<div class="chips" id="${id}">${(v||[]).map((x,i)=>`<span class="chip">${p.type==='chips'?show(p,x):esc(x)}<b data-del="${p.name}" data-i="${i}">×</b></span>`).join('')}<input placeholder="${p.type==='chips'?'value ⏎':'label ⏎'}" data-chip="${p.name}"></div>`;
   else inp=(p.min!=null&&p.max!=null)?slider(id,v,p):num(id,v,p);
@@ -608,7 +608,7 @@ const memo={};   // per-technique parameter memory: switching away and back rest
 // part labels — or shape it (size, turn, modify form), so a new model clears them from the memory as well as from the
 // form (see newModel). An upload after the horse example used to keep its size 300, round 3 and thicken 1: a square
 // cube came back with 14 mm corners and its 15 mm hole closed to 3.5 mm.
-const MODEL_BOUND=['axes','curve','branches','dowels','skip','offset','tilt','roll','thick','grow','pivot','center','extra_x','extra_y',
+const MODEL_BOUND=['axes','curve','branches','dowels','skip','offset','tilt','roll','thick','wall','grow','pivot','center','extra_x','extra_y',
   'rotate','size','scale','shrinkwrap','hollow','thicken','round','smooth'];
 function setMode(name,keep=true){
   const prev=mode; mode=MODES.find(m=>m.name===name)||MODES[0]; location.hash=mode.name;
@@ -1176,11 +1176,12 @@ function highlight(m){for(const c of parts.children)c.material.emissive.set(c.us
   $('#sel').hidden=false;$('#sel').innerHTML=`<b>${selected}</b> <span class="hint">${m.userData.piece!==selected?'('+m.userData.piece+')':''} ${s?.note||''}</span>
    ${row('offset','offset',g('offset')||0,LEN(-ext/2,ext/2,0.5),unit)}${row('tilt','tilt',g('tilt')||0,DEG,'°')}${row('roll','roll',g('roll')||0,DEG,'°')}
    ${bound?'':row('thick','thick',g('thick')||state.thickness,LEN(0.1,20,0.1),unit)}
+   ${walled()&&!bound&&!synthetic?row('wall','wall',g('wall')||state.ring_wall,LEN(0.5,100,0.5),unit):''}
    <div class="row"><span></span><span style="grid-column:2/4"><button class="small" id="s_reset">reset</button> ${synthetic?'':'<button class="small" id="s_del" style="color:var(--err)">delete</button>'} <button class="small" id="s_close">close</button></span></div>
    <small>slide or type · drag the yellow arrow to move it along its normal · drag the <b style="color:#5fcf80">green</b> ring to tilt, the <b style="color:#4f8cff">blue</b> one to roll — it turns where it stands</small>`;
-  for(const k of ['offset','tilt','roll','thick']){const r=$('#r_'+k),n=$('#n_'+k);if(!r)continue;   // a lobe boundary has no thickness row
+  for(const k of ['offset','tilt','roll','thick','wall']){const r=$('#r_'+k),n=$('#n_'+k);if(!r)continue;   // a lobe boundary has no thickness row
     r.oninput=()=>{n.value=r.value;preview(k,+r.value)}; r.onchange=()=>commit(k,+r.value); n.onchange=()=>{r.value=n.value;commit(k,+n.value)}}
-  $('#s_reset').onclick=()=>{for(const k of ['offset','tilt','roll','thick','pivot'])delete state[k]?.[selected];syncEdits();slice()}; $('#s_close').onclick=deselect;
+  $('#s_reset').onclick=()=>{for(const k of ['offset','tilt','roll','thick','wall','pivot'])delete state[k]?.[selected];syncEdits();slice()}; $('#s_close').onclick=deselect;
   if($('#s_del'))$('#s_del').onclick=()=>{state.skip=[...(state.skip||[]),selected];syncEdits();deselect();slice()};
   hlSheet(selected); status(`${$('#status').textContent.replace(/ · selected.*$/,'')} · selected ${selected}`,$('#dot').className);
 }
@@ -1188,11 +1189,13 @@ function preview(k,v){ // live feedback while sliding, before the re-slice
   const ms=parts.children.filter(c=>c.userData.slice===selected), M=(plan.slices.find(x=>x.label===selected)||plan.bounds3d.find(x=>x.label===selected)).M, f=UNIT[unit];
   for(const m of ms){m.matrixAutoUpdate=true;m.position.set(0,0,0);m.rotation.set(0,0,0);
     if(k==='offset'){m.position.copy(m.userData.normal).multiplyScalar(v/f-(state.offset?.[selected]||0))}
-    else if(k!=='thick'){const ax=k==='tilt'?0:1,axis=new THREE.Vector3(M[0][ax],M[1][ax],M[2][ax]),o=pivot3||m.userData.origin,   // about the part's own middle, like the server
+    else if(k!=='thick'&&k!=='wall'){const ax=k==='tilt'?0:1,axis=new THREE.Vector3(M[0][ax],M[1][ax],M[2][ax]),o=pivot3||m.userData.origin,   // about the part's own middle, like the server
       T=new THREE.Matrix4().makeTranslation(o.x,o.y,o.z),R=new THREE.Matrix4().makeRotationAxis(axis,(v-(state[k]?.[selected]||0))*Math.PI/180);m.matrixAutoUpdate=false;m.matrix.copy(T).multiply(R).multiply(T.clone().invert())}}
   dirty=true;
 }
-function commit(k,v){setEdit(k,k==='offset'||k==='thick'?toMM(v):v,k==='thick'?state.thickness:0)}
+function commit(k,v){setEdit(k,k==='offset'||k==='thick'||k==='wall'?toMM(v):v,k==='thick'?state.thickness:k==='wall'?state.ring_wall:0)}
+// ring slices: a slice can have its own wall, set here like its thickness (stacked with `rings` on, and the band lattice)
+const walled=()=>mode.params.some(p=>p.name==='wall')&&(state.rings||!mode.params.some(p=>p.name==='rings'))
 function deselect(){selected=null;$('#sel').hidden=true;gizmo.clear();for(const c of parts.children)c.material.emissive.set(0);hlSheet(null);dirty=true}
 // stored as given: rounding here to 0.01 mm turned 1/16 in (1.5875 mm) into 1.59 mm; toPrecision(12) only drops float noise
 function setEdit(k,v,neutral=0){state[k]=state[k]||{};if(Math.abs(v-neutral)>1e-9)state[k][selected]=+v.toPrecision(12);else delete state[k][selected];
@@ -1225,7 +1228,7 @@ function dropLine(i){const n=i+1,re=x=>x>n?x-1:x;
     if((m=l.match(/^(J-|[RK])(\d+)(-.*)?$/)))return +m[2]===n?null:m[1]+re(+m[2])+(m[3]||'');
     if((m=l.match(/^B-(\d+)-(\d+)$/)))return +m[1]===n||+m[2]===n?null:`B-${re(+m[1])}-${re(+m[2])}`;
     return l};
-  for(const k of ['offset','tilt','roll','thick','pivot'])if(state[k])state[k]=Object.fromEntries(Object.entries(state[k]).map(([l,v])=>[name(l),v]).filter(([l])=>l));
+  for(const k of ['offset','tilt','roll','thick','wall','pivot'])if(state[k])state[k]=Object.fromEntries(Object.entries(state[k]).map(([l,v])=>[name(l),v]).filter(([l])=>l));
   if(state.skip)state.skip=state.skip.map(name).filter(Boolean);
   const list=axisList();list.splice(i,1);return list}
 const rnd=Q=>[+Q.x.toFixed(1),+Q.y.toFixed(1),+Q.z.toFixed(1)];
