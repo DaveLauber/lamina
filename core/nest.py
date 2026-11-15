@@ -303,11 +303,18 @@ def _raster_nest(prepared, sheet, gap, margin, grain=False):
     rots = (0, 180) if grain else ROTS
     sheets, grids = [], []
     for pc, rot0 in prepared:
-        turned, disc = {}, None
-        for r in rots:
-            g = affinity.rotate(pc.nest_shape, rot0 + r, origin=(0, 0))
-            turned[r] = g
-            disc = disc or shapely.maximum_inscribed_circle(g.convex_hull.buffer(half), TOL).length
+        turned = {r: affinity.rotate(pc.nest_shape, rot0 + r, origin=(0, 0)) for r in rots}
+        # only the turns that fit the sheet inside its margin are searched: a part bigger than the sheet (a model
+        # scaled to 10 m) is put on a sheet of its own at once, never rasterized — its mask alone was millions of cells
+        rots_in = [r for r in rots if (lambda b: b[2] - b[0] <= W - 2 * margin and b[3] - b[1] <= H - 2 * margin)(turned[r].bounds)]
+        if not rots_in:
+            b = affinity.rotate(pc.kerfed, rot0, origin=(0, 0)).bounds
+            geom = _put(pc, len(sheets), rot0, margin - b[0], margin - b[1], at=(margin, margin))
+            sheets.append(Sheet(W, H, margin)); grids.append(Grid(W, H, margin))
+            sheets[-1].add(geom.buffer(half), pc); grids[-1].taken[:] = True     # it overhangs the sheet: nothing else goes on it
+            continue
+        hull = turned[rots_in[0]].convex_hull.buffer(half)
+        disc = shapely.maximum_inscribed_circle(hull, max(TOL, math.sqrt(hull.area) / 200)).length
         masks = {}
         best = None
         for k in range(len(sheets) + 1):
@@ -317,7 +324,7 @@ def _raster_nest(prepared, sheet, gap, margin, grain=False):
             if not sh.room(disc):
                 continue
             cr = grid.r
-            for r in rots:
+            for r in rots_in:
                 g = turned[r]
                 if r not in masks:
                     b = g.bounds

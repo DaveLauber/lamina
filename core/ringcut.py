@@ -126,18 +126,27 @@ def shorten(sl, p, limit, rings, geom):
             closed = len(rg.cuts) < 2
             arc = b - a
             k = max(2, math.ceil(arc / limit)) if long else 2
+            near = []
             if closed and not rg.cuts:
                 # the first cut of a closed ring: anywhere — the even spread starts from wherever it lands
                 tries = [a + rg.L * i / int(rg.L / STEP) for i in range(int(rg.L / STEP))]
             else:
-                share = arc / k
-                lo, hi = a + share / 2, a + 1.5 * share
-                if long:
-                    lo, hi = max(lo, b - (k - 1) * limit), min(hi, a + limit)
-                lo, hi = max(lo, a + gap), min(hi, b - gap)
-                tries = _between(lo, hi, min(800, int((hi - lo) / STEP) + 1)) if hi > lo else []
-                tries.sort(key=lambda t: abs(t - (a + share)))
-            got = rg.place(tries, sl, p)
+                # nearest the even spread first, anywhere that keeps the piece before it within the limit: a window
+                # only as wide as the slack in the spread closed to a single point on a band that needs its full count
+                # (2400 mm round at 100 mm: 24 pieces of exactly 100), and one slot there left the band whole
+                target = a + arc / k
+                lo, hi = a + gap, min(b - gap, a + limit) if long else b - gap
+                tries = _between(lo, hi, min(1600, int((hi - lo) / STEP) + 1)) if hi > lo else []
+                tries.sort(key=lambda t: abs(t - target))
+                # a tab is worth a little way, not a stub of a piece: near the spread first, tab or not, then the rest
+                near = [t for t in tries if abs(t - target) <= arc / (4 * k)]
+                tries = near + tries[len(near):]
+            got = rg.place(near, sl, p) if not (closed and not rg.cuts) and near else None
+            got = got or rg.place(tries, sl, p)
+            if got is None and rg.cuts:
+                # nowhere within the limit: anywhere in the stretch, so it is at least shorter, and cut again after
+                wide = _between(a + gap, b - gap, min(1600, int((b - a - 2 * gap) / STEP) + 1)) if b - a > 2 * gap else []
+                got = rg.place(sorted(wide, key=lambda t: abs(t - (a + limit if long else (a + b) / 2))), sl, p)
             if got is None:
                 stuck += 1; done.add((round(a, 3), round(b, 3)))
                 continue
