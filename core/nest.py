@@ -9,6 +9,11 @@ piece pairs, which shapely does. Parts are placed one by one, largest first, eac
 angle plus quarter turns (with `grain`, as it stands or upside down); labels afterwards, in free space next to each
 part, with a leader line.
 
+The no-fit polygons see a placed part's hollow as the largest disc it holds and the part on its way in as its hull,
+and past `MANY` parts they are too slow, so each job is also nested on a raster of the sheet (Grid, _raster_nest):
+every hollow and pocket as it is, for a cell more than the gap — the small parts of a band lattice go into the middle
+of its rings. The rectangle packing is the third; the nest that takes the fewest sheets is kept.
+
 Not taken from Deepnest: its genetic algorithm over the part order and rotations (minutes of search for a few
 percent of sheet) and its merging of shared cut lines.
 """
@@ -234,7 +239,111 @@ class Sheet:
         return c[np.lexsort((c[:, 0], c[:, 1]))[0]]
 
 
-MANY = 150          # above this many pieces the rectangle packer takes over (see nest)
+MANY = 150          # above this many pieces the polygon nest is not tried (see nest)
+RASTER = 1.0        # mm: the cell of the raster nest (see _raster_nest), coarser on a sheet so big it would pass FILL_CELLS
+FILL_CELLS = 1.5e6
+
+
+def _extent(pc):
+    """How much sheet a part takes, holes and pockets counted: the area of its hull. The nest takes parts largest
+    first by this, not by their material: a ring cut from a big band is little material round a big hollow, and
+    ordered by its material it came last, when the sheets were already strewn with small parts and its hollow could
+    no longer take them."""
+    return pc.nest_shape.convex_hull.area
+
+
+def _cells(geom, r, x0, y0, nx, ny):
+    """Which cells of a raster, `r` wide with its corner at (x0, y0), `geom` touches: a cell is taken when its centre
+    is within the half diagonal (and a little: the buffer is a polygon inside the true round one) of `geom`."""
+    xs, ys = np.meshgrid(x0 + (np.arange(nx) + 0.5) * r, y0 + (np.arange(ny) + 0.5) * r)
+    g = geom.buffer(0.75 * r, 4)
+    shapely.prepare(g)
+    return shapely.contains_xy(g, xs, ys)
+
+
+class Grid:
+    """A sheet as a raster for `_raster_nest`: a cell is taken when the margin or a placed part, grown by the gap, touches
+    it. A part that touches only free cells is clear of every placed part by the gap, and inside the margin: no cell
+    is shared, so no point is."""
+    def __init__(self, W, H, margin):
+        self.r = r = max(RASTER, math.sqrt(W * H / FILL_CELLS))
+        self.taken = np.ones((int(math.ceil(H / r)), int(math.ceil(W / r))), bool)
+        i0, j0 = math.ceil(margin / r - 1e-9), math.ceil(margin / r - 1e-9)
+        i1, j1 = int(math.floor((H - margin) / r + 1e-9)), int(math.floor((W - margin) / r + 1e-9))
+        self.taken[i0:i1, j0:j1] = False
+
+    def mark(self, geom):
+        r = self.r; ny, nx = self.taken.shape
+        x0, y0, x1, y1 = geom.bounds
+        j0, i0 = max(int(x0 / r) - 1, 0), max(int(y0 / r) - 1, 0)
+        j1, i1 = min(int(x1 / r) + 2, nx), min(int(y1 / r) + 2, ny)
+        if i1 > i0 and j1 > j0:
+            self.taken[i0:i1, j0:j1] |= _cells(geom, r, j0 * r, i0 * r, j1 - j0, i1 - i0)
+
+    def spot(self, mask):
+        """The lowest, then leftmost, cell where `mask` (the part's own cells) meets no taken one: (i, j), or None.
+        Every offset at once, as a correlation by FFT."""
+        from scipy.signal import fftconvolve
+        h, w = mask.shape; ny, nx = self.taken.shape
+        if h > ny or w > nx:
+            return None
+        hit = fftconvolve(self.taken.astype(np.float32), mask[::-1, ::-1].astype(np.float32), mode="valid")
+        ok = np.argwhere(hit < 0.5)
+        if not len(ok):
+            return None
+        return tuple(ok[np.lexsort((ok[:, 1], ok[:, 0]))[0]])
+
+
+def _raster_nest(prepared, sheet, gap, margin, grain=False):
+    """Every part, largest first, on the first sheet with room for it, at its lowest, then leftmost, spot on a raster
+    of the sheet (see Grid): every hollow a placed ring leaves takes small parts, which rectangles around the parts
+    never could, nor polygons once a placed part's hollow is a disc, at the price of up to a cell more than the gap. A part is
+    tried at its minimum-rectangle angle plus quarter turns (with `grain`, as it stands or upside down)."""
+    W, H = sheet; half = gap / 2
+    rots = (0, 180) if grain else ROTS
+    sheets, grids = [], []
+    for pc, rot0 in prepared:
+        turned, disc = {}, None
+        for r in rots:
+            g = affinity.rotate(pc.nest_shape, rot0 + r, origin=(0, 0))
+            turned[r] = g
+            disc = disc or shapely.maximum_inscribed_circle(g.convex_hull.buffer(half), TOL).length
+        masks = {}
+        best = None
+        for k in range(len(sheets) + 1):
+            if k == len(sheets):
+                sheets.append(Sheet(W, H, margin)); grids.append(Grid(W, H, margin))
+            sh, grid = sheets[k], grids[k]
+            if not sh.room(disc):
+                continue
+            cr = grid.r
+            for r in rots:
+                g = turned[r]
+                if r not in masks:
+                    b = g.bounds
+                    masks[r] = (b, _cells(g, cr, b[0], b[1], int(math.ceil((b[2] - b[0]) / cr)) + 1, int(math.ceil((b[3] - b[1]) / cr)) + 1))
+                b, mask = masks[r]
+                ij = grid.spot(mask)
+                if ij is None:
+                    continue
+                score = (ij[0] + mask.shape[0], ij[1] + mask.shape[1])
+                if best is None or score < best[0]:
+                    best = (score, r, ij[1] * cr - b[0], ij[0] * cr - b[1])
+            if best is not None:
+                break
+            if not sh.pieces and k == len(sheets) - 1:           # not even on an empty sheet (already flagged)
+                break
+        if best is None:
+            b = affinity.rotate(pc.kerfed, rot0, origin=(0, 0)).bounds
+            geom = _put(pc, len(sheets) - 1, rot0, margin - b[0], margin - b[1], at=(margin, margin))
+            sheets[-1].add(geom.buffer(half), pc); grids[-1].mark(geom.buffer(gap))
+            continue
+        _, r, x, y = best
+        _put(pc, k, rot0 + r, x, y)
+        g = affinity.translate(turned[r], x, y)
+        sheets[k].add(g.buffer(half, join_style=1), pc)
+        grids[k].mark(g.buffer(gap, join_style=1))
+    return sheets
 
 
 def _rect_nest(prepared, sheet, gap, margin, grain=False):
@@ -313,24 +422,32 @@ def _nest(pieces, sheet, gap, margin, kerf, labels, font, tag, place, grain):
                 x0, y0, x1, y1 = pc.kerfed.bounds; cx = (x0 + x1) / 2
                 pc.nest_shape = as_multi(unary_union([pc.kerfed, box(cx - w / 2, y1 + 1.0, cx + w / 2, y1 + 1.0 + h)]))
         prepared.append((pc, 0.0 if grain else min_rect_angle(pc.nest_shape)))
-    sheets = _rect_nest(prepared, sheet, gap, margin, grain) if len(prepared) > MANY else _poly_nest(prepared, sheet, gap, margin, grain)
-    if len(prepared) <= MANY and len(sheets) > 1:
-        # the polygon nest fills bottom-left and lets a round part drop into the valley between two below it, which
-        # can cost a whole column (seven rings: five and two, where three and three would do); the plain rectangle
-        # packing is tried as well and kept when it takes fewer sheets, or as many with less on its emptiest one
-        # (seven rings: five and two, where six and one would do — the first sheet full, the last for the rest). The
-        # parts' own areas are compared: the polygon nest keeps grown outlines, and a part too big for the sheet
-        # takes a sheet of its own in a different place in each nest's order. Each nest writes every piece's
-        # placement, so the polygon one is put back when it stays: labels are placed against the outlines the
-        # pieces really have
-        kept = [(pc.place, pc.placed, pc.placed_lines, pc.placed_marks) for pc, _ in prepared]
-        rect = _rect_nest(prepared, sheet, gap, margin, grain)
-        least = lambda ss: min(sum(pc.kerfed.area for pc in sh.pieces) for sh in ss)
-        if len(rect) < len(sheets) or (len(rect) == len(sheets) and least(rect) < least(sheets)):
-            sheets = rect
-        else:
-            for (pc, _), was in zip(prepared, kept):
-                pc.place, pc.placed, pc.placed_lines, pc.placed_marks = was
+    # Each nest is tried and the best kept: the fewest sheets, then the least on the emptiest one — the first sheets
+    # full, the last for the rest. The parts' own areas are compared: the nests keep grown outlines, and a part too big
+    # for the sheet takes a sheet of its own in a different place in each nest's order. Each nest writes every
+    # piece's placement, so the one kept is put back: labels are placed against the outlines the pieces really have.
+    #  - polygons (up to MANY parts; past that it is quadratic in the part count): the tightest against convex
+    #    outlines, but the part on its way in is its hull and a placed part's hollow a disc;
+    #  - the raster (not on a `one_sheet` strip, a hundred metres of cells): a cell more than the gap, but every
+    #    hollow and pocket as it is — small parts go into the middle of a ring, a ring into a bigger one, an arc
+    #    into the bend of another;
+    #  - rectangles: the polygon nest fills bottom-left and lets a round part drop into the valley between two below
+    #    it, which can cost a whole column (seven rings: five and two, where three and three would do).
+    prepared.sort(key=lambda q: -_extent(q[0]))
+    strip = sheet[1] > LONG * sheet[0]
+    nests = ([_poly_nest] if len(prepared) <= MANY else []) + ([] if strip else [_raster_nest]) + [_rect_nest]
+    least = lambda ss: min(sum(pc.kerfed.area for pc in sh.pieces) for sh in ss) if ss else 0.0
+    best = None
+    for run in nests:
+        sheets = run(prepared, sheet, gap, margin, grain)
+        score = (len(sheets), least(sheets))
+        if best is None or score < best[0]:
+            best = (score, sheets, [(pc.place, pc.placed, pc.placed_lines, pc.placed_marks) for pc, _ in prepared])
+        if len(sheets) <= 1:                     # one sheet: nothing beats it, and the polygon nest is the tightest
+            break
+    _, sheets, kept = best
+    for (pc, _), was in zip(prepared, kept):
+        pc.place, pc.placed, pc.placed_lines, pc.placed_marks = was
     if labels:
         for sh in sheets:
             place_labels(sh, font, tag, place)
@@ -342,7 +459,7 @@ def _poly_nest(prepared, sheet, gap, margin, grain=False):
     docstring), largest first; a part bigger than a sheet takes the sheet it lands on to itself."""
     W, H = sheet; half = gap / 2
     rots = (0, 180) if grain else ROTS
-    order = sorted(range(len(prepared)), key=lambda i: -prepared[i][0].kerfed.area)
+    order = sorted(range(len(prepared)), key=lambda i: -_extent(prepared[i][0]))
     grown_all = [pc.nest_shape.buffer(half + TOL, join_style=1) for pc, _ in prepared]   # half the gap on each part keeps them the gap apart
     # a hole no part could go in — a dowel hole, a slot: smaller than the smallest part with its share of the gap — is
     # filled before the outline is cut into convex pieces: each hole is a notch to that cut, and a stacked slice with

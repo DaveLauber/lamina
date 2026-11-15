@@ -10,6 +10,7 @@ from . import MAX_SLICES, Mode, Param, register, spacing_params
 from ..model import ABC
 from ..model import Slice
 from ..ring import collared, ring as ring_of
+from ..ringcut import Ring, shorten
 from ..geometry import dowel, dowel_leverage, hole_reach, LEVERAGE_OK, mark_box, mark_rot, rect_along, as_multi, as_lines, section_polygons, frame_xy, into, to_local
 
 _dist = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])   # noqa: E731
@@ -67,6 +68,9 @@ class Stacked(Mode):
               "A slice can have its own: select it in the 3D view", 0.5, 500, 0.5, unit="mm", show_if=("rings", True), label="wall"),
         Param("ring_caps", "bool", False, "Keep the first and last slice solid, so the stack is closed at both ends. Off = they are rings too",
               show_if=("rings", True), label="solid ends"),
+        Param("max_length", "number", 0.0, "Longest piece of a ring slice (mm), measured along the ring: a longer ring is cut across "
+              "its wall into pieces no longer, spread evenly, clear of the dowel holes, each with a puzzle tab. 0 = no limit. A ring "
+              "too big for the sheet is always cut this way", 0, 10000, 5, unit="mm", show_if=("rings", True), label="max piece length"),
         Param("wall", "map", {}, "Per-slice ring wall (mm), when ring slices are on", group="slices", unit="mm", label="own walls"),
         Param("next_outline", "bool", False, "Engrave the outline of the next layer onto each slice (GUIDE, orange): a light line showing where the layer stacked on top sits, so the stack lines up as it is glued. Drawn only where it lands on the slice's own material — a wider layer above stops at this layer's edge. Engrave, not cut; off by default", label="next layer outline"),
         Param("next_outline_offset", "number", 0.0, "Move the engraved outline in (−) or out (+) from the next layer's true edge (mm). A little negative — −0.25 or so — tucks the line under the layer above, so a glue-up a hair off still hides it; positive marks an overhang where the next layer is wider", -5, 5, 0.05, unit="mm", show_if=("next_outline", True), label="outline offset"),
@@ -102,6 +106,7 @@ class Stacked(Mode):
         self.profiles(ctx, slices)
         slices = [s for s in slices if not s.raw.is_empty]
         rings = self.ring_up(ctx, slices) if p.get("rings") else {}
+        self.ringed = set(rings)
         ctx.rods = []
         ctx.cover_r = self.cover_r(ctx, pos, drawn, length, len(slices))
         if p["space"] > 0 and p["connect"] == "none":
@@ -124,6 +129,19 @@ class Stacked(Mode):
             return 2 * (hole_reach(d + p["slot_offset"], p["dowel_shape"]) + mf) + 0.5
         tab_w, sw = (d if p["space"] == 0 else d * 0.6), p["thickness"] + p["slot_offset"]
         return 2 * (math.hypot(tab_w, sw) / 2 + mf) + 0.5
+
+    def cut(self, ctx, sl):
+        """plan.build's hook: a ring slice longer than `max_length`, or too big for the sheet, cut across its wall into
+        pieces (core/ringcut.py) — or None for the usual splitting."""
+        if sl.label not in getattr(self, "ringed", ()):
+            return None
+        geom, made, plain, stuck = shorten(sl, ctx.p, ctx.p["max_length"], [Ring(c) for c in sl.raw.geoms], sl.profile)
+        if stuck:
+            sl.warnings.append(f"{stuck} piece(s) longer than `max_length` or too big for the sheet found no clean place to be cut "
+                               "(dowel holes close together all along): cut by hand, or move the dowels")
+        if plain:
+            sl.warnings.append(f"{plain} of its {made} cut(s) have no room for a puzzle tab (a narrow wall): glue those")
+        return list(as_multi(geom).geoms) if made else None
 
     @staticmethod
     def ring_up(ctx, slices):
