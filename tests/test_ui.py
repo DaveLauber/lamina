@@ -1334,3 +1334,23 @@ def test_a_ring_slice_takes_its_own_wall_from_the_selection_panel(page):
     assert abs(area(plan(page), "Z-2") - (180 ** 2 - 120 ** 2)) < 300
     assert abs(area(plan(page), "Z-3") - before) < 1                    # the others keep the stack's wall
     assert not page.errors, page.errors
+
+
+def test_a_band_takes_its_own_wall_and_cut_shift_from_the_selection_panel(page):
+    """Band lattice: a band selected in the 3D view shows its wall and its cut shift, and both reach the slicer."""
+    page.click('nav button[data-t="model"]'); page.select_option("#example", "cube"); settle(page)
+    page.click('nav button[data-t="technique"]'); page.click('#modes button[data-m="bands"]'); settle(page)
+    set_fields(page, [("p_nx", 3), ("p_ny", 3), ("p_nz", 3), ("p_ring_wall", 12)])
+    settle(page)
+    p = plan(page)
+    assert p["counts"]["slices"] == 9 and p["counts"]["errors"] == 0, p["counts"]
+    cut = next(s["label"] for s in p["slices"] if len(s["pieces"]) > 1)
+    page.evaluate(f"() => window.__t.select('{cut}')"); page.wait_for_timeout(200)
+    assert page.is_visible("#n_wall") and page.is_visible("#n_cut_shift")
+    page.fill("#n_cut_shift", "5"); page.dispatch_event("#n_cut_shift", "change"); settle(page)
+    assert abs(page.evaluate(f"() => window.__t.state().cut_shift['{cut}']") - 5) < 1e-6
+    page.evaluate(f"() => window.__t.select('{cut}')"); page.wait_for_timeout(200)
+    page.fill("#n_wall", "20"); page.dispatch_event("#n_wall", "change"); settle(page)
+    assert abs(page.evaluate(f"() => window.__t.state().wall['{cut}']") - 20) < 1e-6
+    assert plan(page)["counts"]["errors"] == 0
+    assert not page.errors, page.errors
