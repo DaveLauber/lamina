@@ -13,7 +13,7 @@ from .progress import DETAIL, progress
 from .modes import load_all, Ctx
 from .geometry import section_polygons, as_multi, poly_coords, line_coords, mark_box, mark_rot, min_dims, orient_arrows, trim_thin
 from .checks import STRUCTURAL, check_plan, suggest_fixes, crossing_suggestions
-from .split import split_slice, fits_rotated, islands
+from .split import split_slice, fits_rotated, islands, pieces_of
 from .nest import nest
 from .mesh import load_mesh, reuse, simplify, square_up
 from .identical import mark_identical
@@ -172,6 +172,9 @@ def build(model_path, mode_name, raw_params, out=None, mesh_out=None):
     # split + pack
     progress("nesting the parts on sheets", 0.85)
     for sl in slices:
+        if sl.facets is None and (geoms := mode.cut(ctx, sl)):      # the technique cuts it itself (a locked band)
+            sl.pieces = pieces_of(sl, geoms)
+            continue
         if p["split"] and sl.facets is None:
             split_slice(sl, p["sheet"], p["sheet_margin"], p["tab"], p["grain"])
         else:
