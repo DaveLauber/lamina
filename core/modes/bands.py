@@ -14,19 +14,17 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
-from shapely.geometry import LineString, Point
-from shapely.ops import nearest_points, unary_union
+from shapely.geometry import Point
 
 from . import Mode, Param, register
 from ..geometry import as_multi, crossings, section_polygons, to_local
 from ..model import Slice
 from ..notch import _clip_segments, slot_polygon
 from ..ring import ring as ring_of
-from ..split import tab
+from ..ringcut import STEP, Ring, shorten
 
 FAMS = "xyz"
 ORDERS = ["auto"] + ["".join(o) for o in itertools.permutations(FAMS)]
-CUT_W = 0.1                       # the width of the line a band is cut apart along: the puzzle joint's own fit is the kerf's
 
 
 class Joint:
@@ -84,6 +82,9 @@ class Bands(Mode):
         Param("band_cuts", "bool", True, "Cut every band that cannot slide in whole into pieces that can, between the joints that "
               "ask for different directions, each cut rejoined by a puzzle tab (`tab` wide). Off = such a band is an error",
               label="cut locked bands"),
+        Param("max_length", "number", 0.0, "Longest piece (mm), measured along the band: a longer one is cut again, the cuts spread "
+              "evenly between the joints, clear of the slots, each with a puzzle tab. 0 = no limit. A piece too big for the sheet "
+              "is always cut", 0, 10000, 5, unit="mm", label="max piece length"),
         Param("cut_shift", "map", {}, "Slide a band's cuts along it (mm), each within the stretch between its two joints", group="slices", unit="mm", label="cut shifts"),
     ]
 
@@ -258,87 +259,51 @@ class Bands(Mode):
 
     # ---------------------------------------------------------------- pieces
     def cut(self, ctx, sl):
-        """plan.build's hook: the pieces a locked band is cut into, each cut a line across the wall with a puzzle tab,
-        or None to leave the slice to the usual splitting."""
-        if not ctx.p["band_cuts"] or sl.group.lower() == self.first or sl.group.lower() not in FAMS or not self.joints:
+        """plan.build's hook: the pieces a band is cut into, each cut a line across the wall with a puzzle tab — the
+        cuts a locked band needs to slide in, then more wherever a piece is longer than `max_length` or too big for
+        the sheet — or None to leave the band whole."""
+        if sl.group.lower() not in FAMS or not self.joints:
             return None
-        points = self.cut_points(sl)
-        if not points:
-            return None
-        p = ctx.p; mf = p["min_feature"]; shift = ctx.override("cut_shift", sl.label)
+        p = ctx.p; shift = ctx.override("cut_shift", sl.label)
+        locked = p["band_cuts"] and sl.group.lower() != self.first
+        points = self.cut_points(sl) if locked else []
+        rings = {c.wkb: Ring(c) for c in sl.raw.geoms}           # a shape comes back a new object each time it is asked for
         geom = sl.profile; made = glued = missed = 0
         for comp, s0, s1, pair in points:
-            L = comp.exterior.length; holes = unary_union([LineString(r.coords) for r in comp.interiors])
-            if holes.is_empty:                           # a solid stretch has no inner edge to cut to
+            rg = rings[comp.wkb]
+            if rg.holes.is_empty:                        # a solid stretch has no inner edge to cut to
                 missed += 1
                 continue
             # from the middle of the stretch outward, half a millimetre at a time, anywhere between the two joints: the
             # first place a cut and its tab fit, else the first a plain cut fits (glued). A cut only has to clear the
-            # slots by min_feature, which cut_line checks
+            # slots by min_feature, which cut_line checks. Straight across the wall, or along the slots on either side:
+            # between two slots that cross the wall at a slant — a ring meeting a band at a diagonal — a cut parallel
+            # to them is the one that fits
             mid = min(max((s0 + s1) / 2 + shift, s0), s1)
-            n = min(400, int((s1 - s0) / 0.5) + 1)
+            n = min(400, int((s1 - s0) / STEP) + 1)
             tries = sorted((s0 + (s1 - s0) * k / max(1, n - 1) for k in range(n)), key=lambda t: abs(t - mid))
-            # straight across the wall, or along the slots on either side: between two slots that cross the wall
-            # at a slant — a ring meeting a band at a diagonal — a cut parallel to them is the one that fits
             slants = [np.asarray(to_local(sl.M, [j.mid, j.mid + j.d])[1][:2]) - np.asarray(to_local(sl.M, [j.mid])[0][:2]) for j in pair]
-            best = None
-            for t in tries:
-                E = comp.exterior.interpolate(t % L)
-                ends = [nearest_points(E, holes)[1]] + [self.across(E, v, holes) for v in slants]
-                for I in ends:
-                    if I is None or E.distance(I) < 1e-6:
-                        continue
-                    line, tabbed = self.cut_line(E, I, p, sl, mf)
-                    if line is not None and (tabbed or best is None):
-                        best = (line, tabbed)
-                        if tabbed:
-                            break
-                if best and best[1]:
-                    break
-            if best is None:
+            got = rg.place(tries, sl, p, slants)
+            if got is None:
                 missed += 1
                 continue
-            glued += not best[1]
-            geom = as_multi(geom.difference(best[0]))
+            rg.cuts.append(got)
+            glued += not got[2]
+            geom = as_multi(geom.difference(got[1]))
             made += 1
         if missed:
             sl.warnings.append(f"{missed} of the {len(points)} cut(s) it needs to slide in found no clean place between its joints (slots in the way, "
                                "or a solid wall): it cannot go in as it is — cut it there by hand, or move it or a band it crosses (offset)")
+        geom, more, plain, stuck = shorten(sl, p, p["max_length"], rings.values(), geom)
+        made += more; glued += plain
+        if stuck:
+            sl.warnings.append(f"{stuck} piece(s) longer than `max_length` or too big for the sheet found no clean place to be cut "
+                               "(slots close together all along): cut by hand, or move a band it crosses (offset)")
         if glued:
             sl.warnings.append(f"{glued} of its {made} cut(s) have no room for a puzzle tab (joints close together, or a narrow wall): glue those")
         if not made:
             return None
         return list(as_multi(geom).geoms)
-
-    @staticmethod
-    def across(E, v, holes):
-        """Where a line from E, along ±v, first meets the band's inner edge, or None."""
-        n = float(np.linalg.norm(v))
-        if n < 1e-9:
-            return None
-        v = np.asarray(v) / n; e = np.array([E.x, E.y]); best = None
-        for sgn in (1, -1):
-            hit = LineString([e, e + sgn * v * 1e4]).intersection(holes)
-            for q in ([hit] if hit.geom_type == "Point" else list(getattr(hit, "geoms", []))):
-                if q.geom_type == "Point" and (best is None or E.distance(q) < E.distance(best)):
-                    best = q
-        return best
-
-    @staticmethod
-    def cut_line(E, I, p, sl, mf):
-        """The line a band is cut along from its outline at E to its inner edge at I, with a puzzle tab halfway, and
-        whether the tab fit — or (None, False) where the cut would run into a slot."""
-        e, i = np.array([E.x, E.y]), np.array([I.x, I.y]); L = float(np.linalg.norm(i - e)); u = (i - e) / L
-        straight = LineString([e - u * 1.0, i + u * 1.0])
-        if any(straight.buffer(mf).intersects(c) for c in sl.cuts):
-            return None, False
-        w = min(p["tab"], L / 1.6); parts, tabbed = [straight], False
-        if w >= 2.0:
-            c = (e + i) / 2
-            t = tab(c[0], c[1], tuple(u), w, w * 1.2, 1)
-            if sl.profile.contains(t.buffer(w * 0.25)) and not any(t.buffer(mf).intersects(cc) for cc in sl.cuts):
-                parts, tabbed = [straight.difference(t), t.exterior.difference(straight.buffer(0.03, cap_style=2))], True
-        return unary_union(parts).buffer(CUT_W / 2, cap_style=2), tabbed
 
     @staticmethod
     def fit(p):
