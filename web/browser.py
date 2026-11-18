@@ -27,7 +27,8 @@ def handle(method: str, path: str, query: str, form) -> tuple[int, dict, bytes]:
             out = A.clear(q["client"]) if method == "DELETE" else A.session(q["client"])
         elif path == "api/slice":
             out = A.slice_model(client=f["client"], mode=f["mode"], params=f.get("params", "{}"), example=f.get("example", ""),
-                                job=f.get("job", ""), memo=f.get("memo", "{}"), model=upload)
+                                job=f.get("job", ""), memo=f.get("memo", "{}"), model=upload,
+                                stop=f.get("stop", "nest"))
         elif path.startswith("jobs/"):                       # what StaticFiles serves on the server
             p = A.inside(A.JOBS, path[5:], status=404)
             if not p.is_file():
