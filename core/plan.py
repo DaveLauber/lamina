@@ -3,7 +3,8 @@
     uv run python -m core.plan examples/egg.stl --mode interlocked --set nx=5 ny=4 thickness=3 --out working-files/egg
 """
 from __future__ import annotations
-import argparse, json, os, pathlib, shutil, threading, time
+import argparse, copy, json, os, pathlib, shutil, threading, time
+from types import SimpleNamespace
 import numpy as np
 import shapely
 from shapely.geometry import MultiPolygon
@@ -18,6 +19,7 @@ from .nest import nest
 from .mesh import load_mesh, reuse, simplify, square_up
 from .identical import mark_identical
 from .model import Piece, label_codes, label_tag
+from .stages import STAGES, Entry, StageCache, Tracked, restore, snapshot
 
 MODES = load_all()
 
@@ -114,14 +116,23 @@ def swap_in(write, dest, waits=(0, 0.05, 0.1, 0.2, 0.4, 0.8)):
         tmp.unlink(missing_ok=True)
 
 
-def build(model_path, mode_name, raw_params, out=None, mesh_out=None):
+def build(model_path, mode_name, raw_params, out=None, mesh_out=None, cache: StageCache | None = None, stop="nest"):
+    """The plan for `model_path` cut with technique `mode_name`, run up to the step `stop` (core.stages.STAGES). With a
+    `cache`, each step that ran is kept with the parameters it read, and a step whose inputs have not changed since
+    is taken from it instead of being worked out again (see core.stages). A plan that stops short of `nest` has no
+    sheets: `stage` in it says how far it got, and the parts are shown where they sit in the model."""
+    stop = stop if stop in STAGES else "nest"
+    upto = STAGES.index(stop)
     mode = MODES[mode_name]()                       # its own instance: a technique may keep this build's state on itself
-    p = coerce_params(mode, raw_params)
+    p = Tracked(coerce_params(mode, raw_params))
     p["model_name"] = p["model_name"] or pathlib.Path(model_path).stem   # the server sets the uploaded name; the CLI has the path
     notes = []
     bar.start()
+    pipeline = {}
+    p.begin()
     mesh = load_mesh(model_path, p, notes, mode.surface)
     square = reuse(mesh, "square", lambda m: square_up(m, p["rotate"]))   # offered on the Model tab, beside rotate
+    reads, _ = p.end()
     if mesh_out:                                    # processed model for the browser's ghost view (decimated)
         progress("preparing the preview model", 0.18)
         ghost = reuse(mesh, "preview", lambda m: simplify(m, 30000))
@@ -132,10 +143,85 @@ def build(model_path, mode_name, raw_params, out=None, mesh_out=None):
         # the preview is only what the view shows, never a reason for the slice to fail
         swap_in(ghost.export, pathlib.Path(mesh_out))
         bar.show(str(mesh_out), 0.19)               # the 3D view can show the model now, before the slices
+    pipeline["model"] = {"reads": sorted(reads), "kept": False}
     sheet0 = list(p["sheet"])
     if p["one_sheet"]:                              # one strip as wide as the sheet, as long as it needs: nest against a huge height
         p["sheet"] = [sheet0[0], ONE_SHEET_H]
-    # build → section → check; with autofix = add, floating regions get a crossing slice and we build again (2 rounds)
+    W = SimpleNamespace(mode=mode, ctx=None, slices=[], dropped=[], notes=[], n_err=0, n_warn=0, cov=1.0,
+                        pieces=[], n_sheets=0, kerf=0.0, tag="", codes={}, sheet_thick=[], sheet_out=sheet0, sheet0=sheet0)
+    up = (mesh.metadata.get("lamina_key"), mode_name, str(model_path))   # what the first kept step was built on
+    for name, run, at in (("slices", _stage_slices, 0.2), ("parts", _stage_parts, 0.85), ("nest", _stage_nest, 0.88)):
+        if STAGES.index(name) > upto:
+            break
+        e = cache.get(name, up, p) if cache else None
+        kept = e is not None
+        if kept:
+            progress(f"{name}{DETAIL}kept from the last run", at)
+            W = restore(e, mesh, p)
+            dict.update(p, copy.deepcopy(e.writes))  # what the step set (auto-fix's crossing slices …), as it set it
+            reads = e.reads
+        else:
+            p.begin()
+            run(W, mesh, p, model_path, mode_name)
+            reads, writes = p.end()
+            if cache:
+                e = Entry(up, reads, writes, snapshot(W, mesh, p), (mesh, p))
+                cache.put(name, e)
+        if "sheet" in reads:                        # one_sheet decides the sheet every step reads (set above, untracked)
+            reads = {**reads, "one_sheet": p["one_sheet"]}
+        pipeline[name] = {"reads": sorted(reads), "kept": kept}
+        up = e.token if e else None
+    mode, ctx = W.mode, W.ctx or Ctx(mesh, p)       # stopped after the model: the slicing frame is all there is
+    notes += W.notes
+    progress("done", 1.0)
+    if ctx.notes_extra:
+        notes.append(ctx.notes_extra)
+    if upto >= 1 and W.cov < 0.9 and (W.slices or not ctx.errors):    # stopped before the first slice: the error says why, not this
+        notes.append(f"model coverage {W.cov:.0%}: parts of the model have no geometry — more slices (count / spacing), a different axis, or round/thicken thin features")
+    slices, pieces, sheet_out = W.slices, W.pieces, W.sheet_out
+    P = p.plain()
+    plan = {
+        "model": str(pathlib.Path(model_path).resolve()), "mode": mode_name, "params": P, "notes": notes,
+        "stage": stop, "pipeline": pipeline,                                 # how far this plan got, and what each step read
+        "legend": mode.legend,                                               # what the labels mean (Export tab, assembly key)
+        "bbox": [float(e) for e in mesh.extents],
+        "axes": [a.tolist() for a in ctx.ax], "mid": ctx.mid.tolist(),      # slicing frame (for click-placed points in the UI)
+        "curve3d": ctx.curve3d, "curve_pts": ctx.curve_pts,
+        "axes3d": ctx.axes3d,                                                # radial's fan axes, curve's branches: drawn and dragged in 3D
+        "clip": ctx.clip,                                                    # plaque: the plate's front face [point, normal]; the model behind it is not shown
+        "bounds3d": ctx.bounds3d,                                            # the planes between lobes or at a branch's joint, moved and tilted like slices
+        "spacing": ctx.spacing,                                              # what the drawn spacing curves gave: positions along each axis, for the graph
+        "rods": ctx.rods,                                                    # dowel rods for the 3D view and the key: [[x0,y0,z0],[x1,y1,z1],d,section [[x,y]…] in the slice's x/y,slice x axis,name (Z-3a),from slice,to slice]
+        "params_used": {k: P[k] for k in ("extra_x", "extra_y", "ring_count") if k in P},   # what autofix=add changed
+        "sheets": W.n_sheets, "sheet": sheet_out, "sheet_thick": W.sheet_thick, "kerf": W.kerf,
+        "counts": {"slices": len(slices), "parts": len(pieces), "errors": W.n_err, "warnings": W.n_warn, "faces": int(len(mesh.faces))},
+        "codes": W.codes,                                                    # puzzle mode: engraved code → real label
+        "label_tag": W.tag,                                                  # engraved before every label (the model's name)
+        "errors": ctx.errors, "fixes": ctx.fixes,                            # mode-level errors and their one-click fixes
+        "square": square and {"rotate": square[0], "off": round(square[1], 1)},   # a boxy model a few degrees off its axes
+        "material_area_mm2": float(sum(pc.geom.area for pc in pieces)),
+        "coverage": W.cov,
+        "timing": bar.timing(),
+        "core_d_min": ctx.core_d_min,
+        "sheet_usage": float(sum(pc.geom.area for pc in pieces) / max(1e-9, W.n_sheets * sheet_out[0] * sheet_out[1])) if W.n_sheets else 0.0,
+        "slices": [_slice_json(sl, None if upto >= 2 else [Piece(sl.label, sl.profile, sl, sl.lines, sl.marks)]) for sl in slices],
+        "dropped": [{"label": s.label, "errors": s.errors} for s in W.dropped],
+    }
+    if out:
+        out = pathlib.Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+        # beside, then swapped in, as the preview is: written in place, the page still reading the last plan.json made
+        # the write fail and the slice with it (042). Unlike the preview the plan is the result, so a file Windows
+        # never lets go of is an error that says so, not a slice that quietly shows the plan before it.
+        text = json.dumps(plan)
+        if not swap_in(lambda tmp: tmp.write_text(text), out.with_suffix(".json")):
+            raise OSError(f"the plan could not be written to {out.with_suffix('.json')}: another program keeps that file open")
+    return plan
+
+
+def _stage_slices(W, mesh, p, model_path, mode_name):
+    """Slices: placed, sectioned, checked; with autofix = add, floating regions get a crossing slice and it is built
+    again (2 rounds). Then the fixes on offer, and how much of the model the parts cover."""
+    mode, notes = W.mode, W.notes
     for attempt in range(3):
         # A second pass repeats these stages, which used to send the bar back to 20 % with no word about why. Each
         # extra pass gets a band of its own near the end instead, so the bar only moves forward, and every stage of
@@ -167,10 +253,17 @@ def build(model_path, mode_name, raw_params, out=None, mesh_out=None):
         notes.append(f"{shaved} sliver(s) thinner than {p['min_feature']:g} mm everywhere left out: shavings a slot cuts off its own part, "
                      f"and specks under {p['min_part']:g} mm where a slice only grazes the surface — too small to cut or handle")
     suggest_fixes(slices, p, ctx, mode)
-    n_err += len(ctx.errors) + len(dropped)
+    progress("measuring coverage", 0.8)
+    W.cov = coverage(mesh if ctx.clip is None else mesh.slice_plane(*ctx.clip), slices, ctx.cover_r or max(mesh.extents) / 8, lat=max(3.0, p["thickness"]))
+    W.ctx, W.slices, W.dropped = ctx, slices, dropped
+    W.n_err, W.n_warn = n_err + len(ctx.errors) + len(dropped), n_warn
 
-    # split + pack
-    progress("nesting the parts on sheets", 0.85)
+
+def _stage_parts(W, mesh, p, model_path, mode_name):
+    """Parts: each slice cut into the pieces that are cut out — by the technique (a locked band), split to fit the
+    sheet, or its islands — every one checked against the sheet, and the orientation arrows put on."""
+    mode, ctx, slices = W.mode, W.ctx, W.slices
+    progress("cutting the parts", 0.85)
     for sl in slices:
         if sl.facets is None and (geoms := mode.cut(ctx, sl)):      # the technique cuts it itself (a locked band)
             sl.pieces = pieces_of(sl, geoms)
@@ -179,71 +272,34 @@ def build(model_path, mode_name, raw_params, out=None, mesh_out=None):
             split_slice(sl, p["sheet"], p["sheet_margin"], p["tab"], p["grain"])
         else:
             sl.pieces = islands(sl) if sl.facets is None else [Piece(sl.label, sl.profile, sl, sl.lines, sl.marks)]   # a folded net stays whole
-    n_err += _oversize(slices, p, sheet0, mesh, ctx)
-    pieces = [pc for sl in slices for pc in sl.pieces]
+    W.n_err += _oversize(slices, p, W.sheet0, mesh, ctx)
+    W.pieces = pieces = [pc for sl in slices for pc in sl.pieces]
     if p["orient_mark"]:                               # the same two directions on every part: which way is up, which face is the front
         for pc in pieces:                               # placed after the dowel and seam marks, in the room they leave
             pc.lines = pc.lines + orient_arrows(pc.geom, keep=[mark_box(*m[:3], p["font"], mark_rot(m)) for m in pc.marks])
-    kerf = p["kerf"] if p["compensate"] else 0.0       # off by default: many machines compensate their own kerf
-    tag = label_tag(p, model_path)                     # the model's name, engraved before every label: nested with room for it
-    n_sheets = nest(pieces, p["sheet"], p["gap"], p["sheet_margin"], kerf, p["labels"], p["font"], tag, p["label_place"], p["grain"])
+
+
+def _stage_nest(W, mesh, p, model_path, mode_name):
+    """Nest: the parts on sheets with their labels, which parts are the same part, and what each sheet is cut from."""
+    pieces, sheet0 = W.pieces, W.sheet0
+    progress("nesting the parts on sheets", 0.88)
+    W.kerf = kerf = p["kerf"] if p["compensate"] else 0.0       # off by default: many machines compensate their own kerf
+    W.tag = tag = label_tag(p, model_path)             # the model's name, engraved before every label: nested with room for it
+    W.n_sheets = n_sheets = nest(pieces, p["sheet"], p["gap"], p["sheet_margin"], kerf, p["labels"], p["font"], tag, p["label_place"], p["grain"])
     if crowded := [pc.label for pc in pieces if pc.crowded]:
-        notes.append(f"no free spot beside {len(crowded)} part(s) for their labels ({', '.join(crowded[:6])}{'…' if len(crowded) > 6 else ''}): "
-                     "they sit on the part, overrunning it where it is small — a smaller font, a bigger gap or sheet, or `label_model` off gives them room")
+        W.notes.append(f"no free spot beside {len(crowded)} part(s) for their labels ({', '.join(crowded[:6])}{'…' if len(crowded) > 6 else ''}): "
+                       "they sit on the part, overrunning it where it is small — a smaller font, a bigger gap or sheet, or `label_model` off gives them room")
     mark_identical(pieces, p["mirror_ok"], grain=p["grain"])   # which parts are the same part: one cut file, one row, a quantity
     # puzzle mode: what gets engraved is a code with no order in it. The plan keeps the real labels — the app, the
     # checks and the 3D view are the "plans" you consult when you give up — and the export carries the key.
-    codes = label_codes([pc.label for pc in pieces], f"{pathlib.Path(model_path).name}|{mode_name}") if p["label_style"] == "code" else {}
-    sheet_thick = [p["thickness"]] * n_sheets           # the stock each sheet is cut from: nest keeps one per sheet
+    W.codes = label_codes([pc.label for pc in pieces], f"{pathlib.Path(model_path).name}|{mode_name}") if p["label_style"] == "code" else {}
+    W.sheet_thick = sheet_thick = [p["thickness"]] * n_sheets   # the stock each sheet is cut from: nest keeps one per sheet
     for pc in pieces:
         sheet_thick[pc.place[0]] = pc.parent.thickness
-    sheet_out = sheet0
+    W.sheet_out = sheet0
     if p["one_sheet"]:                              # report the strip at the length the parts and their labels actually took
         top = max([pc.placed.bounds[3] for pc in pieces] + [pc.label_pos[1] + p["font"] * 0.7 for pc in pieces if pc.label_pos], default=0.0) + p["sheet_margin"]
-        sheet_out = [sheet0[0], float(np.ceil(top))]; p["sheet"] = sheet0
-    progress("measuring coverage", 0.94)
-    cov = coverage(mesh if ctx.clip is None else mesh.slice_plane(*ctx.clip), slices, ctx.cover_r or max(mesh.extents) / 8, lat=max(3.0, p["thickness"]))
-    progress("done", 1.0)
-    if ctx.notes_extra:
-        notes.append(ctx.notes_extra)
-    if cov < 0.9 and (slices or not ctx.errors):    # stopped before the first slice: the error says why, not this
-        notes.append(f"model coverage {cov:.0%}: parts of the model have no geometry — more slices (count / spacing), a different axis, or round/thicken thin features")
-
-    plan = {
-        "model": str(pathlib.Path(model_path).resolve()), "mode": mode_name, "params": p, "notes": notes,
-        "legend": mode.legend,                                               # what the labels mean (Export tab, assembly key)
-        "bbox": [float(e) for e in mesh.extents],
-        "axes": [a.tolist() for a in ctx.ax], "mid": ctx.mid.tolist(),      # slicing frame (for click-placed points in the UI)
-        "curve3d": ctx.curve3d, "curve_pts": ctx.curve_pts,
-        "axes3d": ctx.axes3d,                                                # radial's fan axes, curve's branches: drawn and dragged in 3D
-        "clip": ctx.clip,                                                    # plaque: the plate's front face [point, normal]; the model behind it is not shown
-        "bounds3d": ctx.bounds3d,                                            # the planes between lobes or at a branch's joint, moved and tilted like slices
-        "spacing": ctx.spacing,                                              # what the drawn spacing curves gave: positions along each axis, for the graph
-        "rods": ctx.rods,                                                    # dowel rods for the 3D view and the key: [[x0,y0,z0],[x1,y1,z1],d,section [[x,y]…] in the slice's x/y,slice x axis,name (Z-3a),from slice,to slice]
-        "params_used": {k: p[k] for k in ("extra_x", "extra_y", "ring_count") if k in p},   # what autofix=add changed
-        "sheets": n_sheets, "sheet": sheet_out, "sheet_thick": sheet_thick, "kerf": kerf,
-        "counts": {"slices": len(slices), "parts": len(pieces), "errors": n_err, "warnings": n_warn, "faces": int(len(mesh.faces))},
-        "codes": codes,                                                      # puzzle mode: engraved code → real label
-        "label_tag": tag,                                                    # engraved before every label (the model's name)
-        "errors": ctx.errors, "fixes": ctx.fixes,                            # mode-level errors and their one-click fixes
-        "square": square and {"rotate": square[0], "off": round(square[1], 1)},   # a boxy model a few degrees off its axes
-        "material_area_mm2": float(sum(pc.geom.area for pc in pieces)),
-        "coverage": cov,
-        "timing": bar.timing(),
-        "core_d_min": ctx.core_d_min,
-        "sheet_usage": float(sum(pc.geom.area for pc in pieces) / max(1e-9, n_sheets * sheet_out[0] * sheet_out[1])),
-        "slices": [_slice_json(sl) for sl in slices],
-        "dropped": [{"label": s.label, "errors": s.errors} for s in dropped],
-    }
-    if out:
-        out = pathlib.Path(out); out.parent.mkdir(parents=True, exist_ok=True)
-        # beside, then swapped in, as the preview is: written in place, the page still reading the last plan.json made
-        # the write fail and the slice with it (042). Unlike the preview the plan is the result, so a file Windows
-        # never lets go of is an error that says so, not a slice that quietly shows the plan before it.
-        text = json.dumps(plan)
-        if not swap_in(lambda tmp: tmp.write_text(text), out.with_suffix(".json")):
-            raise OSError(f"the plan could not be written to {out.with_suffix('.json')}: another program keeps that file open")
-    return plan
+        W.sheet_out = [sheet0[0], float(np.ceil(top))]; p["sheet"] = sheet0
 
 
 def _profiles(slices, mesh, p, again):
@@ -316,17 +372,19 @@ def _oversize(slices, p, sheet0, mesh, ctx):
     return len(over) + 1
 
 
-def _slice_json(sl):
-    """A slice and its pieces as the plan carries them: the page, the 3D view, the checks and the export read this."""
+def _slice_json(sl, pieces=None):
+    """A slice and its pieces as the plan carries them: the page, the 3D view, the checks and the export read this.
+    `pieces`: in place of its own, for a plan that stopped before the parts were cut (the slice whole, nowhere on a
+    sheet) — a piece not nested yet has no place, kerfed outline or sheet drawing."""
     return {
         "label": sl.label, "group": sl.group, "M": np.round(sl.M, 6).tolist(), "thickness": sl.thickness, "note": sl.note,
         "engages": sl.engages, "extents": [round(sl.bbox[2] - sl.bbox[0], 2), round(sl.bbox[3] - sl.bbox[1], 2)],
         "errors": sl.errors, "warnings": sl.warnings, "fixes": sl.fixes,
-        "pieces": [{"label": pc.label, "place": list(pc.place), "bbox": [round(b, 3) for b in pc.bbox],
+        "pieces": [{"label": pc.label, "place": pc.place and list(pc.place), "bbox": [round(b, 3) for b in pc.bbox],
                     "facets": [{"M": np.round(M, 6).tolist(), "rings": poly_coords(g), **({"hinge": h} if h else {}), **({"bevel": b} if b else {}), **({"t": ft} if ft else {})}   # 3D view; hinge: how a folded panel's face unfolds, bevel: its grooved edges
                                for (M, g), h, b, ft in zip(pc.facets, sl.hinges or [None] * len(pc.facets), sl.bevels or [None] * len(pc.facets), sl.facet_t or [None] * len(pc.facets))],
-                    "kerfed": poly_coords(pc.kerfed),        # local 2D, kerf applied (per-piece export)
-                    "placed": poly_coords(pc.placed),        # sheet coordinates, kerf applied
+                    "kerfed": poly_coords(pc.kerfed if pc.kerfed is not None else pc.geom),        # local 2D, kerf applied (per-piece export)
+                    "placed": poly_coords(pc.placed) if pc.placed is not None else [],        # sheet coordinates, kerf applied
                     "lines": [[s, line_coords(l)[0]] for s, l in pc.placed_lines],   # fold and guide lines on the sheet
                     "kerfed_lines": [[s, line_coords(l)[0]] for s, l in pc.lines],   # the same in the part's own frame (per-piece export)
                     "marks": [[round(m[0], 3), round(m[1], 3), m[2], round(mark_rot(m), 2)] for m in pc.placed_marks],
@@ -335,7 +393,7 @@ def _slice_json(sl):
                     **({"vees": [[round(float(x), 4) for x in v[:7]] + [bool(v[7])] for v in sl.vees]} if sl.vees else {}),
                     **({"thin": [r for g in sl.thin for r in poly_coords(as_multi(g))], "thin_t": sl.thin_t} if sl.thin else {}),   # printed glue tabs: only the skin thick   # printed folded panels: a V groove per fold
                     "area": round(float(pc.geom.area), 3),   # net of holes and slots: × its slice's thickness × density = its weight
-                    } for pc in sl.pieces],
+                    } for pc in (sl.pieces if pieces is None else pieces)],
     }
 
 

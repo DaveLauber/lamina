@@ -14,6 +14,8 @@ header{flex:none;min-height:44px;padding:0 14px;background:#0f1012;border-bottom
 @media (max-width:1700px){header{flex-wrap:wrap;padding:4px 14px;row-gap:4px}}
 header h1{font-size:15px;font-weight:600;letter-spacing:.01em;margin:0 6px 0 0;display:flex;align-items:center;gap:7px}header h1 img{width:20px;height:20px;display:block}
 header a.kofi{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:12px;padding:2px 9px;white-space:nowrap}header a.kofi:hover{color:#ff5e5b;border-color:#ff5e5b}header .sp{flex:1}header select{width:auto}#status{color:var(--muted);font-size:12px;max-width:34vw;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+#pipe{display:flex;align-items:center;gap:3px;font-size:12px}#pipe i{color:var(--muted);font-style:normal}#pipe label{display:flex;align-items:center;gap:3px;margin-right:4px}
+#pipe button[data-stage]{border-left:3px solid #555}#pipe button.ok{border-left-color:var(--ok)}#pipe button.stale{border-left-color:var(--warn)}#pipe button.none{opacity:.7}
 #dot{width:11px;height:11px;border-radius:50%;background:var(--ok);flex:none;box-shadow:0 0 6px var(--ok)}#dot.busy{background:var(--warn);box-shadow:0 0 8px var(--warn);animation:pulse .8s infinite alternate}#dot.err{background:var(--err);box-shadow:0 0 6px var(--err)}
 @keyframes pulse{from{opacity:.4}to{opacity:1}}
 main{display:grid;grid-template-columns:400px 1fr;flex:1;min-height:0}
@@ -160,7 +162,7 @@ dialog button.go{background:#2563eb;border-color:transparent;color:#fff;font-wei
 <button class="small" id="helpbtn" title="how it works, every shortcut, and what to do when something does not fit (?)">? help</button>
 <button class="small" id="newsbtn" title="what changed in this version, and every version before it">what's new</button>
 <button class="small" id="clear" title="delete everything this tab sliced — uploaded models, cut files, session (presets stay)">clear my data</button>
-<span class="sp"></span><span id="dot" title="green = ready · orange = slicing · red = error"></span><span id="status"></span>
+<span class="sp"></span><span id="pipe" title="The steps a slice runs, in order. Green = up to date, orange = a change since reaches it, grey = not run yet. A change only re-runs the first step that reads it and the steps after it: the steps before are kept."><label class="hint" title="on: every change runs the whole pipeline (steps a change does not reach are kept, not re-run). off: changes only mark the steps they reach; run them with the buttons when you are ready"><input type="checkbox" id="auto"> auto</label><button class="small" data-stage="model">model</button><i>›</i><button class="small" data-stage="slices">slices</button><i>›</i><button class="small" data-stage="parts">parts</button><i>›</i><button class="small" data-stage="nest">nest</button><button class="small" id="pnext" title="run the first step that is out of date or not run yet, and stop there">next step</button><button class="small" id="pall" title="run every step to the end (the up-to-date ones are kept)">run all</button></span><span id="dot" title="green = ready · orange = slicing · red = error"></span><span id="status"></span>
 <label style="font-size:12px;color:var(--muted)">view <select id="viewmode"><option value="both">3D + sheets</option><option value="only3d">3D only</option><option value="only2d">sheets only</option></select></label>
 <label style="font-size:12px;color:var(--muted)">units <select id="unit"><option>mm</option><option>cm</option><option>in</option></select></label>
 <a class="kofi" href="https://marcelfarres.github.io/lamina/?ref=app" target="_blank" rel="noopener" data-tip="What Lamina does, every technique explained, how to run it yourself">docs</a><a class="kofi" href="https://github.com/marcelfarres/lamina" target="_blank" rel="noopener" data-tip="Source code, issues, releases (AGPL-3.0)">GitHub</a><a class="kofi" href="https://discord.gg/N66bCQxmt3" target="_blank" rel="noopener" data-tip="Questions, ideas and builds: the Lamina Discord, where other people cutting with it can answer too">Discord</a><a class="kofi" href="https://www.reddit.com/r/Lamina3D" target="_blank" rel="noopener" data-tip="r/Lamina3D on Reddit: show what you built, ask for help, say what Lamina should do next">Reddit</a>
@@ -754,11 +756,48 @@ function syncPresetSelects(){
 }
 
 // ---------------------------------------------------------------- slicing
-async function slice(){
+// ---------------------------------------------------------------- the pipeline's steps
+// The server keeps each step's result with the parameters it read (plan.pipeline[step].reads), so a change re-runs the
+// first step that read it and the steps after it. Here the same lists say which steps a change reaches before anything
+// runs: with `auto` off a change only marks them, and the strip in the header runs up to a step, the next step, or all.
+const PIPE=['model','slices','parts','nest'];
+let auto=ls('slicer_auto',true),sent=null;        // sent: what the plan on show was made from {state, mode, job}
+function stageStatus(){
+  const out={}; let up=false;
+  for(const st of PIPE){
+    const info=plan?.pipeline?.[st], reached=plan&&PIPE.indexOf(st)<=PIPE.indexOf(plan.stage||'nest');
+    if(!info||!reached||!sent){out[st]='none';up=true;continue}
+    let stale=up||(st==='model'&&(!!pendingFile||job!==sent.job))||(st==='slices'&&mode.name!==sent.mode);
+    if(!stale)stale=info.reads.some(k=>JSON.stringify(state[k])!==JSON.stringify(sent.state[k]));
+    out[st]=stale?'stale':'ok'; up=up||stale;
+  }
+  return out;
+}
+function renderPipe(){
+  const ss=stageStatus();
+  for(const b of $$('#pipe button[data-stage]')){const st=b.dataset.stage,info=plan?.pipeline?.[st];
+    b.className='small '+ss[st];
+    b.title=`${st}: ${ss[st]==='ok'?'up to date':ss[st]==='stale'?'out of date: a change since reaches it':'not run yet'}`
+      +(info&&ss[st]!=='none'?` · ${info.kept?'kept from the run before':'worked out in the last run'}`:'')
+      +(info?.reads?.length?`\nreads: ${info.reads.join(', ')}`:'')+'\nclick: run up to here'}
+  $('#auto').checked=auto;
+}
+const nextStage=()=>{const ss=stageStatus();return PIPE.find(st=>ss[st]!=='ok')||'nest'};
+// every change on the page lands here. Auto: the whole pipeline. Manual: a new model is loaded (its own step, so the
+// 3D view has it), anything else waits for the strip
+function slice(){
+  if(auto)return run('nest');
+  if(pendingFile||!job)return run('model');
+  record(); renderPipe();
+  const n=PIPE.filter(st=>stageStatus()[st]!=='ok').length;
+  status(n?`${n} step(s) out of date · run them from the strip`:'up to date',n?'busy':'');
+}
+async function run(stop){
   record();                                        // one undo step per change that gets this far
   if(fresh){trail=[];trailT0=Date.now();act(fresh);fresh=''}   // after record(): a new model's own settings are not steps
   const my=++seq, fd=new FormData(), loading=pendingFile;
-  fd.append('client',CLIENT); fd.append('mode',mode.name); fd.append('params',JSON.stringify({...state,material_kind:kind(state.material)})); fd.append('memo',JSON.stringify(memo));   // the server keeps this as the tab's session; a material of your own is checked as the one it was made from
+  const snap={state:structuredClone(state),mode:mode.name};
+  fd.append('client',CLIENT); fd.append('stop',stop); fd.append('mode',mode.name); fd.append('params',JSON.stringify({...state,material_kind:kind(state.material)})); fd.append('memo',JSON.stringify(memo));   // the server keeps this as the tab's session; a material of your own is checked as the one it was made from
   if(pendingFile)fd.append('model',pendingFile); else if(job)fd.append('job',job); else fd.append('example',$('#example').value);
   status('slicing…','busy'); $('#busy').hidden=false; $('#busy_txt').textContent='slicing…'; $('#busy_note').textContent=''; $('#busy .bar').className='bar';
   expectStages(); $('#busy_steps').innerHTML=''; ghostLive=false;   // this slice's own stages, counted from the settings it runs with
@@ -771,10 +810,12 @@ async function slice(){
     // the server was updated under an open tab: this page is the old one, so fetch it again (once — never a loop)
     if(r.status===422&&!sessionStorage.reloaded){sessionStorage.reloaded=1;return location.reload()}
     if(!r.ok)throw new Error(typeof j.detail==='string'?j.detail:j.detail?JSON.stringify(j.detail):r.statusText);   // a 422 details itself as objects
-    if(pendingFile)srcFile=pendingFile; pendingFile=null; job=j.job; plan=j.plan; const t1=Date.now();
+    if(pendingFile)srcFile=pendingFile; pendingFile=null; job=j.job; plan=j.plan; sent={...snap,job}; const t1=Date.now();
     render3D(j.model); renderSheets(j.sheets); renderReport(); syncSizeHints(); renderSpacing();
-    status(`ready · ${j.took} s · ${plan.counts.parts} parts · ${plan.sheets} ${SH()}(s) · ${plan.counts.errors} errors`,plan.counts.errors?'err':'');
-    act(`sliced in ${j.took} s: ${plan.counts.parts} parts, ${plan.counts.errors} errors, ${plan.counts.warnings} warnings`);
+    renderPipe();
+    status(plan.stage&&plan.stage!=='nest'?`ran to ${plan.stage} · ${j.took} s · ${plan.counts.slices} slices · ${plan.counts.errors} errors`
+      :`ready · ${j.took} s · ${plan.counts.parts} parts · ${plan.sheets} ${SH()}(s) · ${plan.counts.errors} errors`,plan.counts.errors?'err':'');
+    act(`${stop==='nest'?'sliced':'ran to '+stop} in ${j.took} s: ${plan.counts.parts} parts, ${plan.counts.errors} errors, ${plan.counts.warnings} warnings`);
     // where the time went, for anyone tuning it: the build's stages (seconds), the round trip around them, and the page's own drawing
     console.info('lamina timing', mode.name, {...plan.timing, 'round trip beyond the build': +((t1-t0)/1000-j.took).toFixed(2), 'page drawing': (Date.now()-t1)/1000});
   }catch(e){if(my===seq){act('slice failed: '+e.message); status('error: '+inUnit(e.message),'err'); if(loading)modelFailed(loading,e.message)}}
@@ -822,7 +863,7 @@ function syncSizeHints(){const p=allParams().find(q=>q.name==='size'); if(!p||!p
 // three marked 0 only run when the model asks for them, so they appear in the list only once they have.
 const STAGES=[['loading the model',1],['modify form: remeshing',0],['smoothing',0],['preparing the preview model',1],
   ['placing slices and slots',1],['sectioning',1],['checking the parts and the assembly',1],
-  ['nesting the parts on sheets',1],['measuring coverage',1]];
+  ['measuring coverage',1],['cutting the parts',1],['nesting the parts on sheets',1]];
 const seenStages=new Set();
 // The two that only run when the model preparation asks for them are known from the settings before the slice
 // starts, so the count is right from the first frame instead of growing under you. (A mesh that has to be remeshed
@@ -1450,6 +1491,7 @@ function renderWeight(){if(!plan)return;const d=dens(),g=d/1000,by=new Map();   
     +`<div class="hint">at ${+(d*DU()).toPrecision(4)} ${DUNIT()}, set with the material on Sheet &amp; fit</div>`;
 }
 function renderDownloads(){ // the labels checkbox applies to every cut file; the server names files <project or model>_v<rev>_…
+  if(plan.stage&&plan.stage!=='nest'){$('#dl').innerHTML=$('#dlfit').innerHTML=`<div class="hint">this plan was run to the ${plan.stage} step: run the pipeline to the end (nest) to download its files</div>`;return}
   protoHint(); renderWeight();
   const b=`api/job/${CLIENT}/${job}`,L=$('#x_labels').checked?1:0,K=$('#x_key').checked?1:0,G=$('#x_grouped').checked?1:0,step=lenMM('#pr_step',0.1),U=`&units=${unit}`;   // the cut files come out in the unit on show, without a re-slice
   // what the labels on the parts mean, before the cut rather than after it
@@ -1568,6 +1610,11 @@ async function init(){
   const PRESETS=await fetch('api/presets').then(r=>r.ok?r.json():{}).catch(()=>({}));
   $('#example').innerHTML=ex.map(e=>`<option>${e}</option>`).join(''); $('#example').value=ex.includes('blob')?'blob':ex[0];
   $('#modes').innerHTML=MODES.map(m=>`<button data-m="${m.name}">${m.title}</button>`).join('');
+  $('#pipe').onclick=e=>{const b=e.target.closest('button');if(!b||busy)return;
+    if(b.dataset.stage)run(b.dataset.stage); else if(b.id==='pnext')run(nextStage()); else if(b.id==='pall')run('nest')};
+  $('#auto').onchange=e=>{auto=e.target.checked;try{lsSet('slicer_auto',auto)}catch(_){}; act(`auto ${auto?'on':'off'}`);
+    if(auto&&PIPE.some(st=>stageStatus()[st]!=='ok'))run('nest'); else renderPipe()};
+  renderPipe();
   $('#modes').onclick=e=>{if(e.target.dataset.m){deselect();setMode(e.target.dataset.m);countUse('technique',e.target.dataset.m);slice()}};
   $('#material').onchange=e=>{const n=e.target.value,m=matOf(n);state.material=n;
     if(m){const ts=matThicks(n);if(!ts.some(t=>Math.abs(t[0]-state.thickness)<1e-6))state.thickness=ts[Math.floor(ts.length/2)][0];   // a stock thickness of the new material

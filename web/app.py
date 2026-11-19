@@ -3,7 +3,9 @@
 Every request carries a client id — a random secret the browser tab keeps — and everything that client makes lives
 under working-files/jobs/<client>/, so several people can use one server without seeing each other's work.
 
-POST /api/slice        multipart: client, mode, params=<json>, and one of  model=<file> | example=<name> | job=<id> (re-slice the same model)
+POST /api/slice        multipart: client, mode, params=<json>, and one of  model=<file> | example=<name> | job=<id> (re-slice the same model);
+                       stop=model|slices|parts|nest (default nest): run the pipeline up to that step. Each client's steps are
+                       kept with the parameters they read, so a change re-runs only the steps it reaches (core.stages)
                        → {job, plan (with 3D facets + sheet placement), sheets: [svg…], model: url of the processed mesh (STL)}
 GET  /api/modes        mode schemas (drive the form)
 GET  /api/examples     bundled test models
@@ -21,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from core import progress as build_progress
 from core.plan import build, MODES, swap_in
+from core.stages import Caches
 from core.mesh import CAD_SUFFIXES
 from core.export import design_name, export, svg_doc, items_for_sheet, sheet_title
 from core.solid import fit_set, fit_sheets, proto_plan, proto_set, solid_bytes
@@ -106,6 +109,7 @@ _building = threading.local()
 # times slower under the GIL. Now a client's newer slice stops its older one at the older one's next stage.
 _latest: dict[str, int] = {}                       # client → the number of the slice it sent last
 _numbers = itertools.count()
+_caches = Caches()                                 # each client's kept pipeline steps (the last few clients)
 
 
 class Superseded(Exception):
@@ -187,7 +191,8 @@ def presets():
 
 
 @app.post("/api/slice")
-def slice_model(client: str = Form(...), mode: str = Form(...), params: str = Form("{}"), example: str = Form(""), job: str = Form(""), memo: str = Form("{}"), model: UploadFile | None = File(None)):
+def slice_model(client: str = Form(...), mode: str = Form(...), params: str = Form("{}"), example: str = Form(""), job: str = Form(""), memo: str = Form("{}"), model: UploadFile | None = File(None),
+                stop: str = Form("nest")):
     """A job = one source model (working-files/jobs/<client>/<id>/source.txt points at it); re-slicing reuses it.
     Plain `def`: slicing is CPU-bound and can take 15 s, so it runs in the threadpool and nobody else waits on it."""
     if mode not in MODES:
@@ -231,7 +236,8 @@ def slice_model(client: str = Form(...), mode: str = Form(...), params: str = Fo
     try:
         prm = json.loads(params or "{}")
         # the name as it was uploaded (the copy on disk is renamed), engraved before every label; not kept in the session
-        plan = build(mpath, mode, {**prm, "model_name": pathlib.Path(model_name(jd)).stem}, jd / "plan", mesh_out=jd / "model.stl")
+        plan = build(mpath, mode, {**prm, "model_name": pathlib.Path(model_name(jd)).stem}, jd / "plan", mesh_out=jd / "model.stl",
+                     cache=_caches(client), stop=stop)
     except Superseded:
         raise HTTPException(409, "a newer slice of this page replaced this one") from None
     except Exception as e:
@@ -275,6 +281,7 @@ def session(client: str):
 def clear(client: str):
     """The UI's "clear my data": everything this tab sliced — models, cut files, session — goes at once, whatever the TTL."""
     shutil.rmtree(client_dir(client), ignore_errors=True)
+    _caches.drop(client)
     return {}
 
 
@@ -318,7 +325,10 @@ def _plan(client: str, job: str) -> tuple[pathlib.Path, dict]:
     jd = job_dir(client, job)
     if not (jd / "plan.json").exists():
         raise HTTPException(404)
-    return jd, json.loads((jd / "plan.json").read_text())
+    plan = json.loads((jd / "plan.json").read_text())
+    if plan.get("stage", "nest") != "nest":        # run to an earlier step: no parts on sheets yet
+        raise HTTPException(409, f"this job was run to the {plan['stage']} step only: run the pipeline to the end (nest) first")
+    return jd, plan
 
 
 def _zip(client: str, jd: pathlib.Path, plan: dict, make_files, name: str) -> Response:
